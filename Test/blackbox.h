@@ -1,0 +1,40 @@
+
+#ifndef BLACKBOX
+#define BLACKBOX
+
+
+class BlackBox{
+
+  
+ public:
+  
+  virtual float Process() = 0;
+  
+
+};
+
+
+class SinOsc : public BlackBox{
+
+ public:
+
+  SinOsc( int samplerate );
+
+  float Process();
+
+  void SetFrequency( float frequency );
+
+
+ private:
+
+  int sr;
+
+  double phase;
+
+  double delta;
+  
+
+};
+
+
+#endif

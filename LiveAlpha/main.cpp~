@@ -1,0 +1,818 @@
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+#include <unistd.h>
+#include <sndfile.h>
+#include <jack/jack.h>
+#include <jack/transport.h>
+
+#include <string>
+#include <vector>
+
+#include "RtMidi.h"
+
+#include "blackbox.h"
+#include "grainengine.h"
+#include "soundengine.h"
+
+typedef jack_default_audio_sample_t sample_t;
+
+
+struct appdata {
+
+
+  struct {
+
+
+    int SampleRate;
+
+    SoundEngine* Engine;
+
+    bool Ready;
+
+
+  } SoundEngineData;
+
+
+  struct {
+
+
+    jack_client_t *Client;
+    
+
+    jack_port_t *AudioIn;
+    
+    jack_port_t *AudioOut;
+
+
+  } JackData;
+
+
+  struct {
+
+
+    RtMidiIn *MidiIn;
+
+    RtMidiOut *MidiOut;
+
+    vector<unsigned char> MidiMessage;
+
+    bool IsConnected;
+
+
+    unsigned char LightData[8];
+
+
+    unsigned char OutPadData[16];
+
+    unsigned char OutNumData[3];
+
+    unsigned char OutBtnData[19];
+
+
+    unsigned char InPadData[16][2]; // [n][0]: Press/Release, [n][1]: Velocity
+
+    unsigned char InBtnData[19][2];
+
+    unsigned char InKnbData[2];
+
+
+    int JogWheelMode;
+
+    int PadMode;
+
+
+  } PadKontrolData;
+
+
+  struct {
+
+
+    int BPM;
+    
+    int SelectedTrack;
+
+    unsigned char TrackEditMode;
+
+    bool SetTrackEdit;
+
+    
+  } SequencerData;
+
+
+  bool Exit;
+
+
+} AppData;
+
+
+typedef enum {
+
+
+  WHEELMODE_TRACK     = 0,
+  
+  WHEELMODE_BPM       = 1,
+  
+  WHEELMODE_GRAINSIZE = 2
+
+
+} JogWheelModeTypes;
+
+
+typedef enum {
+
+
+  BUTTON_SCENE   = 0,
+  BUTTON_MESSAGE = 1,
+  BUTTON_SETTING = 2,
+  BUTTON_NOTECC  = 3,
+  BUTTON_MIDICH  = 4,
+  BUTTON_SWTYPE  = 5,
+  BUTTON_RELVAL  = 6,
+  BUTTON_VELCTY  = 7,
+  BUTTON_PORT    = 8,
+  BUTTON_FIXVEL  = 9,
+  BUTTON_PRGCHG  = 10,
+  BUTTON_X       = 11,
+  BUTTON_Y       = 12,
+  BUTTON_KNOB1   = 13,
+  BUTTON_KNOB2   = 14,
+  BUTTON_PEDAL   = 15,
+  BUTTON_ROLL    = 16,
+  BUTTON_FLAM    = 17,
+  BUTTON_HOLD    = 18
+ 
+
+} ButtonDataTypes;
+
+
+unsigned char snm1[9] = { 0xf0, 0x42, 0x40, 0x6e, 0x08, 0x00, 0x00, 0x01, 0xf7 };
+
+// F0 42 40 6E 08 3F 2A 00 00 05 05 05 7F 7E 7F 7F 03 0A 0A 0A 0A 0A 0A 0A 0A                             
+// 0A 0A 0A 0A 0A 0A 0A 0A 01 02 03 04 05 06 07 08 09 0A 0B 0C 0d 0E 0F 10 F7                             
+
+unsigned char snm2[50] = { 0xf0, 0x42, 0x40, 0x6e, 0x08, 0x3f, 0x2a, 0x00, 0x00, 0x05, 0x05, 0x05,      \
+                           0x7f, 0x7e, 0x7f, 0x7f, 0x03, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,      \
+                           0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x01, 0x02, 0x03,      \
+                           0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,      \
+                           0x10, 0xf7 };
+
+// F0 42 40 6E 08 3F 0A 01 00 00 00 00 00 00 29 29 29 F7
+
+unsigned char snm3[18] = { 0xf0, 0x42, 0x40, 0x6e, 0x08, 0x3f, 0x0a, 0x01, 0x00, \
+			   0x00, 0x00, 0x00, 0x00, 0x00, 0x53, 0x45, 0x59, 0xf7 };
+
+
+void clearMessage();
+
+void addToMessage( unsigned char* data, int size );
+
+void sendMessage();
+
+
+void MyError( const char *desc );
+
+void SysexOutProcess();
+
+void SysexInProcess( std::vector<unsigned char> *message );
+
+int  Process( jack_nframes_t nframes, void *arg);
+
+int  GetSampleRate( jack_nframes_t nframes, void *arg );
+
+void Error( const char *desc );
+
+void JackShutdown( void *arg );
+
+void Init( int argc, char **argv );
+
+
+int main( int argc,
+	  char **argv ){
+
+
+  Init( argc, argv );
+
+
+  // Don't exit
+  
+  while( AppData.Exit == false ){
+
+    usleep( 20000 );
+
+    SysexOutProcess();
+
+  }
+
+
+  // Exit
+
+  jack_client_close( AppData.JackData.Client );
+
+  exit( 0 );
+  
+
+}
+
+
+void clearMessage(){
+
+  AppData.PadKontrolData.MidiMessage.clear();
+
+}
+
+void addToMessage( unsigned char* data, int size ){
+
+  for( int i = 0; i < size; i++ )
+
+    AppData.PadKontrolData.MidiMessage.push_back( data[i] );
+
+}
+
+void sendMessage(){
+
+  AppData.PadKontrolData.MidiOut->sendMessage( &AppData.PadKontrolData.MidiMessage );
+
+}
+
+
+
+void MyError( const char *desc ){
+
+  printf("%s\n", desc);
+
+  exit( 1 );
+
+}
+
+
+void AudioInProcess( jack_nframes_t nframes, void *arg ){
+
+}
+
+
+void AudioOutProcess( jack_nframes_t nframes, void *arg ){
+
+  
+  sample_t *out = (sample_t*)jack_port_get_buffer( AppData.JackData.AudioOut, nframes );
+
+  for( int i = 0; i < nframes; i++ ){
+
+    out[i] = AppData.SoundEngineData.Engine->Process();
+
+  }
+
+
+}
+
+
+int Process( jack_nframes_t nframes, void *arg ){
+
+
+  if( AppData.SoundEngineData.Ready ){
+    
+    AudioInProcess( nframes, arg );
+    
+    AudioOutProcess( nframes, arg );
+    
+  }
+
+
+  return 0;
+
+
+}
+
+
+int  GetSampleRate( jack_nframes_t nframes, void *arg ){
+
+  if( AppData.SoundEngineData.SampleRate == 0 ){
+
+    AppData.SoundEngineData.SampleRate = nframes;
+
+  } else MyError( "Cannot change sample rate while running!" );
+
+  return 0;
+
+}
+
+
+void Error( const char *desc ){
+
+  printf( "%s\n", desc );
+
+}
+
+
+void JackShutdown( void *arg ){
+
+  exit( 0 );
+
+}
+
+
+// All lights off F0 42 40 6E 08 3F 0A 01 00 00 00 00 00 00 29 29 29 F7
+
+unsigned char setlights[18] = { 0xf0, 0x42, 0x40, 0x6e, 0x08, 0x3f, 0x0a, 0x01, \
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x29, 0x29, 0xf7 };
+
+
+void SysexOutProcess(){
+
+
+  int index = 0;
+
+  
+  for( int i = 0; i < 16; i++ )
+
+    AppData.PadKontrolData.OutPadData[i] = 0;
+
+  if( AppData.SoundEngineData.Engine->Tracks.size() > 0 && \
+      AppData.SequencerData.SelectedTrack           > 0     ){
+
+    index = AppData.SoundEngineData.Engine->Tracks[ AppData.SequencerData.SelectedTrack - 1 ]->CurrentStep;
+
+    AppData.PadKontrolData.OutPadData[index] = 1;
+
+    }
+
+
+  memset( AppData.PadKontrolData.LightData, 0, 5 );
+
+
+  for( int i = 0; i < 19; i++ )
+
+    AppData.PadKontrolData.LightData[ ( i + 16 ) / 7 ] |= 
+
+      ( AppData.PadKontrolData.OutBtnData[i] > 0 ? 1 : 0 ) << ( ( i + 16 ) % 7 );
+
+
+  for( int i = 0; i < 16; i++ )
+
+    AppData.PadKontrolData.LightData[ index / 7 ] |=
+      
+      ( AppData.PadKontrolData.OutPadData[i] > 0 ? 1 : 0 ) << ( i % 7 );
+
+
+  //
+
+
+  clearMessage();
+
+  addToMessage( setlights, 18 );
+
+  AppData.PadKontrolData.MidiMessage[8 ] = AppData.PadKontrolData.LightData[0];
+  AppData.PadKontrolData.MidiMessage[9 ] = AppData.PadKontrolData.LightData[1];
+  AppData.PadKontrolData.MidiMessage[10] = AppData.PadKontrolData.LightData[2];
+  AppData.PadKontrolData.MidiMessage[11] = AppData.PadKontrolData.LightData[3];
+  AppData.PadKontrolData.MidiMessage[12] = AppData.PadKontrolData.LightData[4];
+
+  AppData.PadKontrolData.MidiMessage[14] = AppData.PadKontrolData.OutNumData[0];
+  AppData.PadKontrolData.MidiMessage[15] = AppData.PadKontrolData.OutNumData[1];
+  AppData.PadKontrolData.MidiMessage[16] = AppData.PadKontrolData.OutNumData[2];
+
+  sendMessage();
+  
+
+}
+
+
+void SetNum( unsigned int num ){
+
+  
+  int val = num;
+
+
+  for( int i = 0; i < 3; i++ ){
+
+    AppData.PadKontrolData.OutNumData[i] = ( val % 10 ) + 0x30;
+
+    val = val / 10;
+    
+  }
+
+
+}
+
+
+void StoreInput( std::vector<unsigned char> *message ){
+  
+
+  // F0 42 40 6E 08 -- PadKONTROL Sysex Message 
+
+  if( message->at( 0 ) == 0xf0 && \
+      message->at( 1 ) == 0x42 && \
+      message->at( 2 ) == 0x40 && \
+      message->at( 3 ) == 0x6e && \
+      message->at( 4 ) == 0x08    ){
+    
+    
+    switch( message->at( 5 ) ){
+
+      int val;
+      
+      int index;
+
+    case 0x45: // Pads
+      
+      val = message->at( 6 );
+      
+      if( val & 0x40 ){
+	
+	if( AppData.SoundEngineData.Engine->Tracks.size() && AppData.SequencerData.SelectedTrack > 0 )
+	  
+	  AppData.SoundEngineData.Engine->Tracks[AppData.SequencerData.SelectedTrack-1]->SetStep( val & 0x0f );
+	
+      }
+      
+      break;
+
+      
+    case 0x48: // Buttons
+
+
+      if( message->at( 6 ) == BUTTON_SETTING ){
+
+	AppData.SequencerData.SetTrackEdit = message->at( 7 ) > 0 ? true : false;
+
+	AppData.PadKontrolData.OutBtnData[BUTTON_SETTING] = message->at( 7 ) > 0 ? 1 : 0;
+
+      }
+
+
+      if( message->at( 7 ) > 0 ){
+	
+
+	if( message->at( 6 ) == BUTTON_SCENE ){
+	  
+	  AppData.SequencerData.TrackEditMode ^= ( 1 << 0 );
+	  
+	  AppData.PadKontrolData.OutBtnData[BUTTON_SCENE] =
+	    
+	    AppData.SequencerData.TrackEditMode & ( 1 << 0 ) ? 1 : 0;
+	  
+	}
+	
+	if( message->at( 6 ) == BUTTON_MESSAGE ){
+	  
+	  AppData.SequencerData.TrackEditMode ^= ( 1 << 1 );
+	  
+	  AppData.PadKontrolData.OutBtnData[BUTTON_MESSAGE] =
+	    
+	    AppData.SequencerData.TrackEditMode & ( 1 << 1 ) ? 1 : 0;
+	  
+	}
+	
+	if( message->at( 6 ) == BUTTON_FIXVEL ){
+	  
+	  AppData.SequencerData.TrackEditMode ^= ( 1 << 2 );
+	  
+	  AppData.PadKontrolData.OutBtnData[BUTTON_FIXVEL] =
+	    
+	    AppData.SequencerData.TrackEditMode & ( 1 << 2 ) ? 1 : 0;
+	  
+	}
+	
+	if( message->at( 6 ) == BUTTON_PRGCHG ){
+	  
+	  AppData.SequencerData.TrackEditMode ^= ( 1 << 3 );
+	  
+	  AppData.PadKontrolData.OutBtnData[BUTTON_PRGCHG] =
+	    
+	    AppData.SequencerData.TrackEditMode & ( 1 << 3 ) ? 1 : 0;
+	  
+	}
+	
+	
+	SetNum( AppData.SequencerData.TrackEditMode );
+	
+
+      }
+	
+      break;
+
+      
+    case 0x43: // Wheel
+      
+	if( AppData.SequencerData.SetTrackEdit ){
+
+	  switch( AppData.SequencerData.TrackEditMode ){
+
+	  case 0:
+	
+	    AppData.SequencerData.BPM += message->at(7) == 0x01 ? 5 : -5;
+	    
+	    AppData.SoundEngineData.Engine->SetTempo( AppData.SequencerData.BPM );
+	    
+	    SetNum( AppData.SequencerData.BPM );
+	    
+	    break;
+
+	  }
+
+	} else {
+
+	  AppData.SequencerData.SelectedTrack += message->at(7) == 0x01 ? 1 : -1;
+	  
+	  while( AppData.SequencerData.SelectedTrack < 0 )
+	    
+	    AppData.SequencerData.SelectedTrack++;
+	  
+	  while( AppData.SequencerData.SelectedTrack > AppData.SoundEngineData.Engine->Tracks.size() )
+	    
+	    AppData.SequencerData.SelectedTrack--;
+	  
+	  SetNum( AppData.SequencerData.SelectedTrack );
+
+	}
+
+      break;
+
+    }
+    
+    
+  }
+
+
+}
+
+
+void ProcessInput(){
+
+  
+
+}
+
+
+void SysexInProcess( std::vector<unsigned char> *message ){
+
+  StoreInput( message );
+
+  ProcessInput();
+
+}
+
+
+void MidiCallback( double deltatime, std::vector< unsigned char > *message, void *userData ){
+
+  /*
+  unsigned int nBytes = message->size();
+
+  for ( unsigned int i=0; i<nBytes; i++ )
+
+    printf( "%2x, ", (int)message->at(i) );
+
+  if ( nBytes > 0 )
+
+    printf("\n");
+  */
+
+  SysexInProcess( message );
+
+
+}
+
+
+void Init( int argc, char **argv ){
+
+
+  // Check args
+
+  if( argc < 4 ) MyError("Useage: live <bpm> <grainsize> <firstfile.wav> ... <lastfile.wav>");
+
+
+  // Init AppData struct
+
+  AppData.Exit = false;
+
+  AppData.PadKontrolData.IsConnected = false;
+
+  AppData.SoundEngineData.SampleRate = 0;
+
+  AppData.SoundEngineData.Engine = NULL;
+
+  AppData.SoundEngineData.Ready = false;
+
+  for( int i = 0; i < 8; i++ )
+
+    AppData.PadKontrolData.LightData[i] = 0;
+
+  AppData.PadKontrolData.JogWheelMode = WHEELMODE_TRACK;
+
+  AppData.SequencerData.BPM = atoi(argv[1]);
+  
+  AppData.SequencerData.SelectedTrack = 0;
+
+  AppData.SequencerData.SetTrackEdit = false;
+
+
+  // Make a new Jack client
+
+  AppData.JackData.Client = jack_client_open( "LiveAlpha", JackNullOption, NULL, NULL );
+
+  if( AppData.JackData.Client == NULL ) MyError( "Could not open client" );
+
+
+  // Set Jack callbacks
+
+  jack_set_sample_rate_callback( AppData.JackData.Client, GetSampleRate, NULL );
+
+  jack_set_process_callback( AppData.JackData.Client, Process, NULL );
+
+  jack_on_shutdown( AppData.JackData.Client, JackShutdown, NULL );
+
+  jack_set_error_function( Error );
+
+
+  // Set up ports
+
+  AppData.JackData.AudioIn = jack_port_register( AppData.JackData.Client,
+						 "Record",
+						 JACK_DEFAULT_AUDIO_TYPE,
+						 JackPortIsInput,
+						 0 );
+
+  AppData.JackData.AudioOut = jack_port_register( AppData.JackData.Client,
+						  "Playback",
+						  JACK_DEFAULT_AUDIO_TYPE,
+						  JackPortIsOutput,
+						  0 );
+
+  if( AppData.JackData.AudioIn  == NULL || AppData.JackData.AudioOut == NULL )
+    
+    MyError( "Error opening ports." );
+  
+
+  // Activate client
+
+  if( jack_activate( AppData.JackData.Client ) )
+
+    MyError( "Unable to activate client." );
+
+
+  // Connect to output ports                                                                              
+
+  int i = 0;
+
+  const char **ports = jack_get_ports( AppData.JackData.Client,
+				 NULL,
+				 "audio",
+				 JackPortIsPhysical | JackPortIsOutput );
+
+  if( ports == NULL ) MyError( "Could not find input audio ports." );
+
+  while( ports[i] != NULL ){
+
+    jack_connect( AppData.JackData.Client,
+		  ports[i],
+		  jack_port_name( AppData.JackData.AudioIn ) );
+
+    i++;
+
+  }
+
+  free( ports );
+
+  i = 0;
+
+  ports = jack_get_ports( AppData.JackData.Client,
+			  NULL,
+			  "audio",
+			  JackPortIsPhysical | JackPortIsInput );
+
+  if( ports == NULL ) MyError( "Could not find input audio ports." );
+
+  while( ports[i] != NULL ){
+
+    jack_connect( AppData.JackData.Client,
+		  jack_port_name( AppData.JackData.AudioOut ),
+		  ports[i] );
+
+    i++;
+
+  }
+
+  free( ports );
+
+  
+  // Configure rtmidi
+
+  try {
+
+    AppData.PadKontrolData.MidiIn  = new RtMidiIn();
+
+  }
+
+  catch ( RtError &error ) {
+
+    error.printMessage();
+
+    exit( EXIT_FAILURE );
+
+  }
+
+
+  try {
+
+    AppData.PadKontrolData.MidiOut = new RtMidiOut();
+
+  }
+  
+  catch ( RtError &error ) {
+    
+    error.printMessage();
+    
+    exit( EXIT_FAILURE );
+
+  }
+  
+
+  unsigned int niports = AppData.PadKontrolData.MidiIn->getPortCount();
+
+  unsigned int noports = AppData.PadKontrolData.MidiOut->getPortCount();
+
+  
+  bool connected = false;
+  
+  for( int i = 0; i < niports; i++ ){
+    
+    if( AppData.PadKontrolData.MidiIn->getPortName( i ).compare( std::string( "padKONTROL PORT A" ) ) == 0 ){
+      
+      AppData.PadKontrolData.MidiIn->openPort( i );
+      
+      connected = true;
+      
+    }
+    
+  }
+  
+  AppData.PadKontrolData.MidiIn->setCallback( MidiCallback );
+
+  AppData.PadKontrolData.MidiIn->ignoreTypes( false, true, true );
+
+  if( connected == false ) MyError("Could not connect to input MIDI port.");
+
+  connected = false;
+  
+  for( int i = 0; i < noports; i++ ){
+
+    if( AppData.PadKontrolData.MidiOut->getPortName( i ).compare( std::string( "padKONTROL CTRL" ) ) == 0 ){
+
+      AppData.PadKontrolData.MidiOut->openPort( i );
+
+      connected = true;
+
+    }
+
+  }
+  
+  if( connected == false ) MyError("Could not connect to output MIDI port.");
+  
+
+  // Set up padKONTROL
+
+  clearMessage();
+
+  addToMessage( snm1, 9 );
+
+  addToMessage( snm2, 50 );
+
+  addToMessage( snm3, 18 );
+
+  sendMessage();
+
+
+  // Allow open connection to padKONTROL
+
+  AppData.PadKontrolData.IsConnected = true;
+
+
+  // Set up sound engine
+
+  while( AppData.SoundEngineData.SampleRate == 0 )
+
+    usleep( 1000 );
+
+  AppData.SoundEngineData.Engine = new SoundEngine( AppData.SoundEngineData.SampleRate,
+						    AppData.SequencerData.BPM,
+						    8,
+						    60,
+						    atoi(argv[2]) );
+
+  if( argc > 3 ){
+
+    for( int i = 2; i < argc; i++ ){
+
+      AppData.SoundEngineData.Engine->NewTrack( argv[i] );
+
+    }
+
+  }
+
+
+  AppData.SoundEngineData.Ready = true;
+
+
+}
